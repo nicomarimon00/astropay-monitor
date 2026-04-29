@@ -56,11 +56,11 @@ const C = {
 };
 
 // ─── Utility ─────────────────────────────────────────────────────────────────
-const fmt = (n) =>
+const fmt = (n: number | null | undefined) =>
   n?.toLocaleString("es-AR", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) ?? "—";
-const fmtTime = (ts) =>
+const fmtTime = (ts: number) =>
   new Date(ts).toLocaleTimeString("es-AR", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-const pctChange = (now, prev) =>
+const pctChange = (now: number, prev: number) =>
   prev ? (((now - prev) / prev) * 100).toFixed(3) : "0.000";
 
 // ─── Fetch helpers ────────────────────────────────────────────────────────────
