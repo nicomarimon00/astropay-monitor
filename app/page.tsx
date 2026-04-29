@@ -3,20 +3,8 @@
  * AstroPay Price Monitor
  * Dark terminal / financial dashboard aesthetic
  * React + Recharts + Tailwind-compatible inline styles
- *
- * Architecture:
- *  - usePricePoller: hook that fetches USDT/ARS price on interval
- *  - usePriceHistory: hook that manages history array (50 samples) + localStorage
- *  - useAlerts: hook that handles sound alarm + browser push notifications
- *  - UI: StatusBar, PriceHero, LiveChart, HistoryTable, SettingsPanel
- *
- * Fetch strategy (waterfall):
- *  1. CryptoYa API (reliable, public, no-CORS)  →  "buy" price in ARS
- *  2. Binance P2P snapshot (fallback)
- *  3. Mock jitter on last known price (offline fallback)
  */
 
-"use client";
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import {
   LineChart,
@@ -29,12 +17,12 @@ import {
   ReferenceLine,
 } from "recharts";
 
-// ─── Constants ──────────────────────────────────────────────────────────────
+// ─── Constants ───────────────────────────────────────────────────────────────
 const MAX_HISTORY = 50;
 const LS_KEY = "astropay_price_history_v2";
 const INTERVALS = [15, 30, 60, 120];
 
-// ─── Colour tokens ──────────────────────────────────────────────────────────
+// ─── Colour tokens ───────────────────────────────────────────────────────────
 const C = {
   bg: "#080c10",
   surface: "#0d1117",
@@ -55,6 +43,27 @@ const C = {
   accentDim: "#00b8ff15",
 };
 
+// ─── Types ───────────────────────────────────────────────────────────────────
+interface PriceEntry {
+  ts: number;
+  bid: number;
+  ask: number;
+  source: string;
+  pct?: string;
+}
+
+interface PriceResult {
+  bid: number;
+  ask: number;
+  source: string;
+}
+
+interface AlertEntry {
+  ts: number;
+  price: number;
+  pct: string;
+}
+
 // ─── Utility ─────────────────────────────────────────────────────────────────
 const fmt = (n: number | null | undefined) =>
   n?.toLocaleString("es-AR", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) ?? "—";
@@ -64,22 +73,19 @@ const pctChange = (now: number, prev: number) =>
   prev ? (((now - prev) / prev) * 100).toFixed(3) : "0.000";
 
 // ─── Fetch helpers ────────────────────────────────────────────────────────────
-async function fetchCryptoYa() {
-  // CryptoYa public API – USDT/ARS exchange (astropay wallet)
+async function fetchCryptoYa(): Promise<PriceResult> {
   const res = await fetch(
     "https://criptoya.com/api/astropay/usdt/ars/1",
     { signal: AbortSignal.timeout(8000) }
   );
   if (!res.ok) throw new Error("cryptoya non-ok");
   const data = await res.json();
-  // Response: { ask, totalAsk, bid, totalBid, time }
   const bid = Number(data?.bid ?? data?.totalBid ?? data?.ask);
   if (!bid || isNaN(bid)) throw new Error("cryptoya parse fail");
   return { bid, ask: Number(data.ask ?? data.totalAsk ?? bid), source: "CryptoYa" };
 }
 
-async function fetchBinanceP2P() {
-  // Binance P2P public snapshot for USDT→ARS
+async function fetchBinanceP2P(): Promise<PriceResult> {
   const body = JSON.stringify({
     fiat: "ARS", page: 1, rows: 5, tradeType: "BUY",
     asset: "USDT", countries: [], proMerchantAds: false,
@@ -95,20 +101,22 @@ async function fetchBinanceP2P() {
   });
   if (!res.ok) throw new Error("binance non-ok");
   const data = await res.json();
-  const prices = data?.data?.map((d: any) => Number(d.adv?.price)).filter(Boolean);
-  if (!prices?.length) throw new Error("binance parse fail");
-  const bid = (prices as number[]).reduce((a, b) => a + b, 0) / prices.length;
+  const prices = (data?.data ?? []).map((d: { adv?: { price?: string } }) =>
+    Number(d.adv?.price)
+  ).filter((p: number) => Boolean(p)) as number[];
+  if (!prices.length) throw new Error("binance parse fail");
+  const bid = prices.reduce((a: number, b: number) => a + b, 0) / prices.length;
   return { bid, ask: bid * 1.005, source: "Binance P2P" };
 }
 
-async function fetchPrice() {
+async function fetchPrice(): Promise<PriceResult | null> {
   try { return await fetchCryptoYa(); } catch (_) {}
   try { return await fetchBinanceP2P(); } catch (_) {}
-  return null; // both failed → caller handles fallback
+  return null;
 }
 
 // ─── Sound ────────────────────────────────────────────────────────────────────
-function playAlertSound(ctx) {
+function playAlertSound(ctx: AudioContext | null) {
   if (!ctx) return;
   const osc = ctx.createOscillator();
   const gain = ctx.createGain();
@@ -123,8 +131,18 @@ function playAlertSound(ctx) {
   osc.stop(ctx.currentTime + 0.5);
 }
 
-// ─── Custom Tooltip for chart ─────────────────────────────────────────────────
-const ChartTooltip = ({ active, payload }) => {
+// ─── Custom Tooltip ───────────────────────────────────────────────────────────
+interface TooltipPayloadItem {
+  payload: PriceEntry & { i: number };
+}
+
+const ChartTooltip = ({
+  active,
+  payload,
+}: {
+  active?: boolean;
+  payload?: TooltipPayloadItem[];
+}) => {
   if (!active || !payload?.length) return null;
   const d = payload[0].payload;
   return (
@@ -158,22 +176,22 @@ export default function AstroPayMonitor() {
   const [showSettings, setShowSettings] = useState(false);
 
   // ── Price state ─────────────────────────────────────────────────────────────
-  const [history, setHistory] = useState(() => {
+  const [history, setHistory] = useState<PriceEntry[]>(() => {
     try {
       const saved = localStorage.getItem(LS_KEY);
-      return saved ? JSON.parse(saved) : [];
+      return saved ? (JSON.parse(saved) as PriceEntry[]) : [];
     } catch { return []; }
   });
-  const [status, setStatus] = useState("idle"); // idle | fetching | ok | error
-  const [lastUpdated, setLastUpdated] = useState(null);
+  const [status, setStatus] = useState<"idle" | "fetching" | "ok" | "error">("idle");
+  const [lastUpdated, setLastUpdated] = useState<number | null>(null);
   const [countdown, setCountdown] = useState(0);
   const [source, setSource] = useState("—");
-  const [alertLog, setAlertLog] = useState([]);
+  const [alertLog, setAlertLog] = useState<AlertEntry[]>([]);
 
   // ── Refs ────────────────────────────────────────────────────────────────────
-  const audioCtx = useRef(null);
-  const timerRef = useRef(null);
-  const countRef = useRef(null);
+  const audioCtx = useRef<AudioContext | null>(null);
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const countRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const lastFetchTime = useRef(0);
 
   // ── Derived ─────────────────────────────────────────────────────────────────
@@ -185,26 +203,43 @@ export default function AstroPayMonitor() {
   const isDown = pct < 0;
   const priceColor = isUp ? C.green : isDown ? C.red : C.accent;
 
-  // Average of last 10 samples for alert comparison
   const avg10 = useMemo(() => {
     if (history.length < 2) return null;
     const slice = history.slice(-10);
     return slice.reduce((s, h) => s + h.bid, 0) / slice.length;
   }, [history]);
 
-  // ── Persist history to localStorage ─────────────────────────────────────────
+  // ── Persist history ──────────────────────────────────────────────────────────
   useEffect(() => {
     try { localStorage.setItem(LS_KEY, JSON.stringify(history.slice(-MAX_HISTORY))); }
     catch (_) {}
   }, [history]);
 
-  // ── Audio context (lazy, after user gesture) ──────────────────────────────
-  const ensureAudio = useCallback(() => {
+  // ── Audio context ──────────────────────────────────────────────────────────
+  const ensureAudio = useCallback((): AudioContext | null => {
     if (!audioCtx.current) {
-      audioCtx.current = new (window.AudioContext || window.webkitAudioContext)();
+      // webkitAudioContext for older Safari
+      const AudioCtx =
+        window.AudioContext ??
+        (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+      if (!AudioCtx) return null;
+      audioCtx.current = new AudioCtx();
     }
     return audioCtx.current;
   }, []);
+
+  // ── Refs for stable callback ──────────────────────────────────────────────
+  const alarmEnabledRef = useRef(alarmEnabled);
+  const alertThresholdRef = useRef(alertThreshold);
+  const avg10Ref = useRef(avg10);
+  const webhookUrlRef = useRef(webhookUrl);
+  const currentPriceRef = useRef(currentPrice);
+
+  useEffect(() => { alarmEnabledRef.current = alarmEnabled; }, [alarmEnabled]);
+  useEffect(() => { alertThresholdRef.current = alertThreshold; }, [alertThreshold]);
+  useEffect(() => { avg10Ref.current = avg10; }, [avg10]);
+  useEffect(() => { webhookUrlRef.current = webhookUrl; }, [webhookUrl]);
+  useEffect(() => { currentPriceRef.current = currentPrice; }, [currentPrice]);
 
   // ── Fetch & update ────────────────────────────────────────────────────────
   const doFetch = useCallback(async () => {
@@ -213,12 +248,12 @@ export default function AstroPayMonitor() {
     const now = Date.now();
 
     if (!result) {
-      // Fallback: jitter last known price ±0.05%
       setStatus("error");
-      if (currentPrice) {
-        const jitter = currentPrice * (1 + (Math.random() - 0.5) * 0.001);
+      const lastPrice = currentPriceRef.current;
+      if (lastPrice) {
+        const jitter = lastPrice * (1 + (Math.random() - 0.5) * 0.001);
         setHistory((h) => {
-          const entry = { ts: now, bid: jitter, ask: jitter * 1.005, source: "offline" };
+          const entry: PriceEntry = { ts: now, bid: jitter, ask: jitter * 1.005, source: "offline" };
           return [...h.slice(-(MAX_HISTORY - 1)), entry];
         });
       }
@@ -232,7 +267,7 @@ export default function AstroPayMonitor() {
 
     setHistory((h) => {
       const prev = h[h.length - 1];
-      const entry = {
+      const entry: PriceEntry = {
         ts: now,
         bid: result.bid,
         ask: result.ask,
@@ -241,44 +276,44 @@ export default function AstroPayMonitor() {
       };
       const next = [...h.slice(-(MAX_HISTORY - 1)), entry];
 
-      // Check alert threshold
-      const ref = avg10 ?? prev?.bid;
-      if (alarmEnabled && ref) {
-        const diff = Math.abs(pctChange(result.bid, ref));
-        if (Number(diff) >= alertThreshold) {
-          playAlertSound(ensureAudio());
-          // Browser push notification
+      const ref = avg10Ref.current ?? prev?.bid;
+      if (alarmEnabledRef.current && ref) {
+        const diff = Math.abs(Number(pctChange(result.bid, ref)));
+        if (diff >= alertThresholdRef.current) {
+          playAlertSound(audioCtx.current);
           if (Notification.permission === "granted") {
             new Notification("⚡ AstroPay Alert", {
-              body: `USDT/ARS cambió ${diff}% → $${fmt(result.bid)}`,
+              body: `USDT/ARS cambió ${diff.toFixed(3)}% → $${fmt(result.bid)}`,
               icon: "https://cryptoya.com/favicon.ico",
             });
           }
-          // Webhook
-          if (webhookUrl) {
-            fetch(webhookUrl, {
+          const hook = webhookUrlRef.current;
+          if (hook) {
+            fetch(hook, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({
-                text: `⚡ AstroPay USDT/ARS: $${fmt(result.bid)} (${diff}% cambio)`,
+                text: `⚡ AstroPay USDT/ARS: $${fmt(result.bid)} (${diff.toFixed(3)}% cambio)`,
               }),
             }).catch(() => {});
           }
           setAlertLog((a) => [
-            { ts: now, price: result.bid, pct: diff },
+            { ts: now, price: result.bid, pct: diff.toFixed(3) },
             ...a.slice(0, 9),
           ]);
         }
       }
       return next;
     });
-  }, [alarmEnabled, alertThreshold, avg10, currentPrice, ensureAudio, webhookUrl]);
+  }, []); // stable — reads latest values via refs
 
   // ── Polling loop ──────────────────────────────────────────────────────────
   useEffect(() => {
     doFetch();
     timerRef.current = setInterval(doFetch, interval * 1000);
-    return () => clearInterval(timerRef.current);
+    return () => {
+      if (timerRef.current) clearInterval(timerRef.current);
+    };
   }, [interval, doFetch]);
 
   // ── Countdown ─────────────────────────────────────────────────────────────
@@ -287,7 +322,9 @@ export default function AstroPayMonitor() {
       const elapsed = (Date.now() - lastFetchTime.current) / 1000;
       setCountdown(Math.max(0, Math.ceil(interval - elapsed)));
     }, 500);
-    return () => clearInterval(countRef.current);
+    return () => {
+      if (countRef.current) clearInterval(countRef.current);
+    };
   }, [interval]);
 
   // ── Notification permission ───────────────────────────────────────────────
@@ -303,29 +340,28 @@ export default function AstroPayMonitor() {
       minHeight: "100vh", background: C.bg, color: C.text,
       fontFamily: "'JetBrains Mono', 'Fira Code', 'Courier New', monospace",
       fontSize: 13, lineHeight: 1.5,
-    },
-    container: { maxWidth: 960, margin: "0 auto", padding: "0 16px 40px" },
+    } as React.CSSProperties,
+    container: { maxWidth: 960, margin: "0 auto", padding: "0 16px 40px" } as React.CSSProperties,
     card: {
       background: C.card, border: `1px solid ${C.border}`,
       borderRadius: 10, padding: "18px 20px", marginBottom: 16,
-    },
+    } as React.CSSProperties,
     cardTitle: {
-      fontSize: 10, letterSpacing: "0.15em", textTransform: "uppercase",
+      fontSize: 10, letterSpacing: "0.15em", textTransform: "uppercase" as const,
       color: C.textMuted, marginBottom: 14, display: "flex",
       alignItems: "center", gap: 8,
-    },
-    dot: (col) => ({
+    } as React.CSSProperties,
+    dot: (col: string): React.CSSProperties => ({
       width: 6, height: 6, borderRadius: "50%", background: col,
-      boxShadow: `0 0 6px ${col}`,
-      display: "inline-block",
+      boxShadow: `0 0 6px ${col}`, display: "inline-block",
     }),
-    badge: (col, bg) => ({
+    badge: (col: string, bg?: string): React.CSSProperties => ({
       display: "inline-flex", alignItems: "center", gap: 5,
       background: bg ?? col + "18", color: col,
       borderRadius: 4, padding: "2px 8px", fontSize: 11,
       border: `1px solid ${col}30`,
     }),
-    btn: (col = C.accent, ghost = false) => ({
+    btn: (col: string = C.accent, ghost: boolean = false): React.CSSProperties => ({
       background: ghost ? "transparent" : col + "18",
       color: col, border: `1px solid ${col}40`,
       borderRadius: 6, padding: "7px 14px", cursor: "pointer",
@@ -336,8 +372,8 @@ export default function AstroPayMonitor() {
       background: C.surface, color: C.text,
       border: `1px solid ${C.border}`, borderRadius: 6,
       padding: "7px 10px", fontFamily: "inherit", fontSize: 12,
-      outline: "none", width: "100%", boxSizing: "border-box",
-    },
+      outline: "none", width: "100%", boxSizing: "border-box" as const,
+    } as React.CSSProperties,
   };
 
   // ── Status indicator ──────────────────────────────────────────────────────
@@ -363,7 +399,6 @@ export default function AstroPayMonitor() {
   // ─────────────────────────────────────────────────────────────────────────
   return (
     <div style={s.app}>
-      {/* Google Font */}
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&display=swap');
         * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -395,7 +430,6 @@ export default function AstroPayMonitor() {
             </h1>
           </div>
           <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-            {/* Status badge */}
             <div style={s.badge(statusColor)}>
               <span className={status === "ok" ? "pulse-dot" : ""} style={s.dot(statusColor)} />
               {statusLabel}
@@ -418,7 +452,7 @@ export default function AstroPayMonitor() {
           {alarmEnabled && <span style={{ color: C.yellow }}>🔔 Alarma activa ({alertThreshold}%)</span>}
         </div>
 
-        {/* ── Settings panel (collapsible) ── */}
+        {/* ── Settings panel ── */}
         {showSettings && (
           <div style={{ ...s.card, borderColor: C.borderAccent, marginBottom: 16 }} className="fade-in">
             <div style={s.cardTitle}>⚙ Configuración</div>
@@ -427,11 +461,7 @@ export default function AstroPayMonitor() {
                 <label style={{ color: C.textMuted, fontSize: 11, display: "block", marginBottom: 6 }}>
                   Intervalo de actualización
                 </label>
-                <select
-                  style={s.input}
-                  value={interval}
-                  onChange={(e) => setIntervalSec(Number(e.target.value))}
-                >
+                <select style={s.input} value={interval} onChange={(e) => setIntervalSec(Number(e.target.value))}>
                   {INTERVALS.map((v) => <option key={v} value={v}>{v}s</option>)}
                 </select>
               </div>
@@ -448,31 +478,21 @@ export default function AstroPayMonitor() {
                 <label style={{ color: C.textMuted, fontSize: 11, display: "block", marginBottom: 6 }}>
                   Webhook URL (Telegram / Slack)
                 </label>
-                <input
-                  style={s.input}
-                  placeholder="https://hooks.slack.com/..."
-                  value={webhookUrl}
-                  onChange={(e) => setWebhookUrl(e.target.value)}
-                />
+                <input style={s.input} placeholder="https://hooks.slack.com/..."
+                  value={webhookUrl} onChange={(e) => setWebhookUrl(e.target.value)} />
               </div>
             </div>
             <div style={{ display: "flex", gap: 8, marginTop: 14, flexWrap: "wrap" }}>
-              <button
-                style={s.btn(alarmEnabled ? C.red : C.green)}
-                onClick={() => {
-                  ensureAudio();
-                  requestNotifPermission();
-                  setAlarmEnabled((v) => !v);
-                }}
-              >
+              <button style={s.btn(alarmEnabled ? C.red : C.green)} onClick={() => {
+                ensureAudio(); requestNotifPermission(); setAlarmEnabled((v) => !v);
+              }}>
                 {alarmEnabled ? "🔕 Desactivar alarma" : "🔔 Activar alarma"}
               </button>
               <button style={s.btn(C.yellow)} onClick={() => playAlertSound(ensureAudio())}>
                 🔊 Probar sonido
               </button>
               <button style={s.btn(C.red, true)}
-                onClick={() => { setHistory([]); localStorage.removeItem(LS_KEY); }}
-              >
+                onClick={() => { setHistory([]); localStorage.removeItem(LS_KEY); }}>
                 🗑 Limpiar historial
               </button>
             </div>
@@ -483,7 +503,6 @@ export default function AstroPayMonitor() {
         <div style={{ ...s.card, borderColor: currentPrice ? (isUp ? C.green + "60" : isDown ? C.red + "60" : C.border) : C.border }}
           className="hover-card">
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 16 }}>
-            {/* Left: price */}
             <div>
               <div style={s.cardTitle}>
                 <span style={s.dot(C.accent)} />
@@ -509,7 +528,6 @@ export default function AstroPayMonitor() {
                 </div>
               )}
             </div>
-            {/* Right: mini stats */}
             <div style={{ display: "flex", flexDirection: "column", gap: 8, alignItems: "flex-end" }}>
               {avg10 && (
                 <div style={{ textAlign: "right" }}>
@@ -529,15 +547,12 @@ export default function AstroPayMonitor() {
               )}
             </div>
           </div>
-
-          {/* Progress bar countdown */}
           <div style={{ marginTop: 16, background: C.surface, borderRadius: 3, height: 3, overflow: "hidden" }}>
             <div style={{
               height: "100%",
               width: `${((interval - countdown) / interval) * 100}%`,
               background: `linear-gradient(90deg, ${C.accent}, ${C.blue})`,
-              borderRadius: 3,
-              transition: "width 0.5s linear",
+              borderRadius: 3, transition: "width 0.5s linear",
             }} />
           </div>
         </div>
@@ -566,7 +581,7 @@ export default function AstroPayMonitor() {
                   axisLine={false} tickLine={false} interval="preserveStartEnd" />
                 <YAxis domain={[chartMin, chartMax]} tick={{ fill: C.textMuted, fontSize: 10 }}
                   axisLine={false} tickLine={false} width={70}
-                  tickFormatter={(v) => `$${fmt(v)}`} />
+                  tickFormatter={(v: number) => `$${fmt(v)}`} />
                 <Tooltip content={<ChartTooltip />} />
                 {avg10 && (
                   <ReferenceLine y={avg10} stroke={C.yellow} strokeDasharray="4 3"
