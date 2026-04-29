@@ -95,7 +95,7 @@ async function fetchBinanceP2P() {
   });
   if (!res.ok) throw new Error("binance non-ok");
   const data = await res.json();
-  const prices = data?.data?.map((d) => Number(d.adv?.price)).filter(Boolean);
+  const prices = data?.data?.map((d: any) => Number(d.adv?.price)).filter(Boolean);
   if (!prices?.length) throw new Error("binance parse fail");
   const bid = prices.reduce((a, b) => a + b, 0) / prices.length;
   return { bid, ask: bid * 1.005, source: "Binance P2P" };
